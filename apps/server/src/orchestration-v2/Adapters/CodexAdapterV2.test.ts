@@ -881,6 +881,188 @@ describe("CodexAdapterV2 process exit", () => {
   );
 });
 
+describe("CodexAdapterV2 MCP apps", () => {
+  it.effect("reaches an MCP app's server on a thread a restarted app-server has not loaded", () =>
+    Effect.gen(function* () {
+      const scenario = "mcp-app-unloaded-thread";
+      const startedThreadId = `native-${scenario}-started`;
+      const restoredThreadId = `native-${scenario}-restored`;
+      const preamble = codexReplayPreamble({
+        nativeThreadId: startedThreadId,
+        nativeTurnId: "unused-turn",
+        prompt: "unused",
+      });
+      const preambleResult = (label: string) => {
+        const entry = preamble.find(
+          (candidate) => candidate.type === "emit_inbound" && candidate.label === label,
+        );
+        return entry?.type === "emit_inbound" &&
+          Predicate.hasProperty(entry.frame, "result") &&
+          Predicate.isObject(entry.frame.result)
+          ? entry.frame.result
+          : {};
+      };
+      const threadResult = preambleResult("thread/start");
+      // A restarted app-server only knows threads it started or resumed since it launched.
+      const loadedThreads = new Set<string>();
+      const threadFor = (id: string) => ({
+        ...(Predicate.hasProperty(threadResult, "thread") && Predicate.isObject(threadResult.thread)
+          ? threadResult.thread
+          : {}),
+        id,
+        status: { type: loadedThreads.has(id) ? "idle" : "notLoaded" },
+      });
+      const sentMethods: Array<string> = [];
+      const toolCalls: Array<unknown> = [];
+      const input = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+      const emit = (frame: unknown) =>
+        Queue.offer(input, new TextEncoder().encode(JSON.stringify(frame) + "\n"));
+      const answer = (method: string, params: Record<string, unknown>): unknown => {
+        const threadId = typeof params.threadId === "string" ? params.threadId : "";
+        switch (method) {
+          case "initialize":
+            return preambleResult("initialize");
+          case "thread/start":
+            loadedThreads.add(startedThreadId);
+            return { ...threadResult, thread: threadFor(startedThreadId) };
+          case "thread/read":
+            return { thread: threadFor(threadId) };
+          case "thread/resume":
+            loadedThreads.add(threadId);
+            return { ...threadResult, thread: threadFor(threadId) };
+        }
+        if (!loadedThreads.has(threadId)) {
+          return { error: { code: -32600, message: `thread not found: ${threadId}` } };
+        }
+        if (method === "mcpServerStatus/list") {
+          return {
+            data: [
+              {
+                name: "ratings",
+                authStatus: "unsupported",
+                resources: [],
+                resourceTemplates: [],
+                tools: {
+                  set_rating: { name: "set_rating", inputSchema: { type: "object" } },
+                },
+              },
+            ],
+            nextCursor: null,
+          };
+        }
+        if (method === "mcpServer/tool/call") {
+          toolCalls.push(params);
+          return { content: [{ type: "text", text: "Saved 4 stars." }] };
+        }
+        return { error: { code: -32601, message: `unexpected method ${method}` } };
+      };
+      const client = yield* CodexClient.make(
+        Stdio.make({
+          args: Effect.succeed([]),
+          stdin: Stream.fromQueue(input),
+          stdout: () =>
+            Sink.forEach((chunk: string | Uint8Array) =>
+              Effect.forEach(
+                (typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk))
+                  .split("\n")
+                  .filter((line) => line.trim().length > 0),
+                (line) => {
+                  const frame = JSON.parse(line) as {
+                    readonly id?: number;
+                    readonly method: string;
+                    readonly params?: Record<string, unknown>;
+                  };
+                  sentMethods.push(frame.method);
+                  if (frame.id === undefined) return Effect.void;
+                  const response = answer(frame.method, frame.params ?? {});
+                  return emit(
+                    Predicate.hasProperty(response, "error")
+                      ? { id: frame.id, error: response.error }
+                      : { id: frame.id, result: response },
+                  );
+                },
+                { discard: true },
+              ),
+            ),
+          stderr: () => Sink.drain,
+        }),
+      );
+      const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        settings: DEFAULT_CODEX_SETTINGS,
+        environment: {},
+        clientFactory: { open: () => Effect.succeed(client) },
+        crypto: yield* Crypto.Crypto,
+        fileSystem: yield* FileSystem.FileSystem,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        serverConfig: yield* ProviderReplayHarness.makeReplayServerConfig(scenario).pipe(
+          Effect.orDie,
+        ),
+      });
+      const threadId = ThreadId.make(`thread-${scenario}`);
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(`session-${scenario}`),
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+      const startedThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+      const restoredThread: OrchestrationV2ProviderThread = {
+        ...startedThread,
+        id: ProviderThreadId.make(`provider-thread-${scenario}-restored`),
+        appThreadId: ThreadId.make(`thread-${scenario}-restored`),
+        nativeThreadRef: {
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeId: restoredThreadId,
+          strength: "strong",
+        },
+      };
+      const failureText = (error: unknown) =>
+        Predicate.hasProperty(error, "payload") ? `${error} ${error.payload}` : String(error);
+      const mcpApps = runtime.mcpApps;
+      if (mcpApps === undefined) {
+        return yield* Effect.die("Codex adapter runtime must expose MCP apps.");
+      }
+
+      const tools = yield* mcpApps
+        .listTools({ providerThread: restoredThread, server: "ratings" })
+        .pipe(Effect.result);
+      const call = yield* mcpApps
+        .callTool({
+          providerThread: restoredThread,
+          server: "ratings",
+          tool: "set_rating",
+          arguments: { stars: 4 },
+        })
+        .pipe(Effect.result);
+
+      assert.deepEqual(
+        tools._tag === "Success"
+          ? tools.success.map((tool) => tool.name)
+          : failureText(tools.failure),
+        ["set_rating"],
+        "listing an MCP app's tools must load a thread this app-server has not loaded",
+      );
+      assert.deepEqual(
+        call._tag === "Success" ? call.success.content : failureText(call.failure),
+        [{ type: "text", text: "Saved 4 stars." }],
+        "calling an MCP app's tool must load a thread this app-server has not loaded",
+      );
+      assert.lengthOf(toolCalls, 1);
+      assert.notInclude(sentMethods, "turn/start", "loading the thread must not start a turn");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+});
+
 describe("CodexAdapterV2 session initialize", () => {
   const openReplaySession = (
     transcript: CodexReplay.CodexAppServerReplayTranscript,
